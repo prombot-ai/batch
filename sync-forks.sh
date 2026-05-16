@@ -53,30 +53,23 @@ if [ -z "$GITHUB_TOKEN" ]; then
     exit 1
 fi
 
-get_forks() {
-    local page=1
-    local per_page=100
-    
-    while true; do
-        local response=$(gh api "orgs/${ORG}/repos" \
-            --paginate \
-            --jq "[.[] | select(.fork == true) | {name: .name, full_name: .full_name, parent: .parent.full_name}]" \
-            -F page="$page" \
-            -F per_page="$per_page" 2>/dev/null)
-        
-        if [ -z "$response" ] || [ "$response" = "[]" ]; then
-            break
-        fi
-        
-        echo "$response" | jq -r '.[] | "\(.full_name)|\(.parent)"'
-        
-        page=$((page + 1))
-        
-        local next_page=$(echo "$response" | jq -r 'length')
-        if [ "$next_page" -lt "$per_page" ]; then
-            break
-        fi
-    done
+# List fork repos in the org. Uses GET (listing); do not use -F without --method GET here,
+# or gh defaults to POST and hits "create repository" on the same path.
+list_fork_full_names() {
+    gh api "orgs/${ORG}/repos" \
+        --method GET \
+        --paginate \
+        -f per_page=100 \
+        -f type=forks \
+        --jq '.[] | .full_name'
+}
+
+# Minimal repo objects from org listing omit `parent`; fetch full repo metadata.
+get_parent_full_name() {
+    local fork_full_name="$1"
+    gh api "repos/${fork_full_name}" \
+        --method GET \
+        --jq '.parent.full_name // empty' || true
 }
 
 sync_fork() {
@@ -120,22 +113,30 @@ total=0
 success=0
 failed=0
 
-while IFS='|' read -r fork_full_name parent_repo; do
+while IFS= read -r fork_full_name; do
     if [ -z "$fork_full_name" ]; then
         continue
     fi
-    
+
     total=$((total + 1))
-    
+
+    parent_repo="$(get_parent_full_name "$fork_full_name")"
+    if [ -z "$parent_repo" ]; then
+        echo "Error: could not resolve parent for ${fork_full_name} (is it a fork?)" >&2
+        failed=$((failed + 1))
+        echo ""
+        continue
+    fi
+
     if sync_fork "$fork_full_name" "$parent_repo"; then
         success=$((success + 1))
     else
         failed=$((failed + 1))
     fi
-    
+
     echo ""
-    
-done < <(get_forks)
+
+done < <(list_fork_full_names)
 
 echo "========================================="
 echo "Sync Summary"
